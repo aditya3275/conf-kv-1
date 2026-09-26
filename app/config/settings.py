@@ -11,8 +11,18 @@ class Settings(BaseSettings):
     Centralized ConfidentialKV-Scheduler configuration.
 
     Configuration can come from environment variables or a local
-    .env file. The control plane uses one canonical SQLite database
-    for shared local state.
+    .env file.
+
+    The control plane uses centralized configuration so that:
+        - OPA endpoint
+        - VerifKV endpoint
+        - serving backend timeout
+        - database paths
+        - backend configuration
+        - health monitoring
+        - VerifKV reconciliation
+
+    are all controlled from one place.
     """
 
     model_config = SettingsConfigDict(
@@ -34,6 +44,18 @@ class Settings(BaseSettings):
     opa_timeout_seconds: float = 2.0
 
     # ------------------------------------------------------------------
+    # VerifKV external provenance service
+    # ------------------------------------------------------------------
+
+    verifkv_url: str = "http://127.0.0.1:9000"
+
+    # ------------------------------------------------------------------
+    # Upstream serving backend
+    # ------------------------------------------------------------------
+
+    upstream_timeout_seconds: float = 60.0
+
+    # ------------------------------------------------------------------
     # Unified control-plane storage
     # ------------------------------------------------------------------
 
@@ -49,11 +71,13 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
 
     outbox_db_path: str = "data/outbox.db"
+
     verifkv_db_path: str = "data/verifkv.db"
+
     backends_config_path: str = "configs/backends.yaml"
 
     # ------------------------------------------------------------------
-    # VerifKV
+    # VerifKV security
     # ------------------------------------------------------------------
 
     verifkv_hmac_secret: SecretStr
@@ -63,6 +87,7 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
 
     health_cache_ttl_seconds: float = 5.0
+
     health_check_timeout_seconds: float = 1.5
 
     # ------------------------------------------------------------------
@@ -76,10 +101,8 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """
     Return the process-wide Settings instance.
-
-    The cached accessor preserves compatibility with modules that use
-    dependency-style configuration loading.
     """
+
     return Settings()
 
 
