@@ -6,7 +6,7 @@ def test_settings_loads_with_explicit_secret() -> None:
         verifkv_hmac_secret="test-secret",
     )
 
-    assert settings.app_name == "Conf-kv-1"
+    assert settings.app_name == "ConfidentialKV-Scheduler Control Plane"
     assert settings.opa_url == "http://127.0.0.1:8181"
     assert settings.control_plane_db_path == "data/control_plane.db"
     assert settings.verifkv_hmac_secret.get_secret_value() == "test-secret"

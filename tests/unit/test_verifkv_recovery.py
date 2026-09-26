@@ -1,93 +1,246 @@
-from datetime import datetime, timezone
-from uuid import uuid4
+from __future__ import annotations
 
-import pytest
+import sqlite3
 
-from app.models.enums import Zone
-from app.verifkv.service import VerifKVService
-from app.verifkv.store import VerifKVStore
-from app.verifkv.writer import VerifKVWriter
+from app.models.verifkv import (
+    VerifKVEvent,
+    VerifKVEventType,
+)
+
+from verifkv_service.store import VerifKVStore
 
 
-@pytest.mark.asyncio
-async def test_unreconciled_outbox_is_recovered_after_restart(
+def create_store(
     tmp_path,
-):
-    db_path = tmp_path / "control_plane.db"
+) -> tuple[VerifKVStore, str]:
 
-    # --------------------------------------------
-    # Process 1
-    # --------------------------------------------
+    db_path = tmp_path / "verifkv.db"
 
-    store1 = VerifKVStore(
+    store = VerifKVStore(
         db_path=str(db_path),
-        hmac_secret="secret",
+        hmac_secret="test-secret",
     )
 
-    await store1.initialize()
+    return store, str(db_path)
 
-    request_id = uuid4()
 
-    outbox_seq = await store1.append_authorization_outbox(
+def create_event(
+    event_type: VerifKVEventType,
+    request_id: str,
+) -> VerifKVEvent:
+
+    return VerifKVEvent(
+        event_type=event_type,
+        source="recovery-test",
+        tenant_id="tenant-001",
         request_id=request_id,
-        tenant_id="tenant-a",
-        decision=True,
-        backend_id="vllm-secure-01",
-        zone=Zone.SECURE,
-        decision_id="decision-001",
-        policy_version="v1",
-        timestamp=datetime.now(timezone.utc),
-        payload={},
+        payload={
+            "backend_id": "backend-a",
+            "value": request_id,
+        },
     )
 
-    assert outbox_seq == 1
 
-    # Simulate crash before the asynchronous writer processes it.
-    await store1.close()
+def test_tampered_payload_is_detected(
+    tmp_path,
+) -> None:
 
-    # --------------------------------------------
-    # Process 2 / restart
-    # --------------------------------------------
+    store, db_path = create_store(tmp_path)
 
-    store2 = VerifKVStore(
+    event = create_event(
+        VerifKVEventType.ROUTE_ASSIGNED,
+        "request-001",
+    )
+
+    store.append(event)
+
+    connection = sqlite3.connect(db_path)
+
+    connection.execute(
+        """
+        UPDATE verifkv_events
+        SET payload_json = ?
+        WHERE event_id = ?
+        """,
+        (
+            '{"tampered":true}',
+            str(event.event_id),
+        ),
+    )
+
+    connection.commit()
+    connection.close()
+
+    result = store.verify_chain()
+
+    assert result["valid"] is False
+
+    assert result["failed_sequence"] == 1
+
+    assert result["reason"] == "event_hash_mismatch"
+
+
+def test_tampered_event_hash_is_detected(
+    tmp_path,
+) -> None:
+
+    store, db_path = create_store(tmp_path)
+
+    event = create_event(
+        VerifKVEventType.AUTHZ_DECISION,
+        "request-001",
+    )
+
+    store.append(event)
+
+    connection = sqlite3.connect(db_path)
+
+    connection.execute(
+        """
+        UPDATE verifkv_events
+        SET event_hash = ?
+        WHERE event_id = ?
+        """,
+        (
+            "0" * 64,
+            str(event.event_id),
+        ),
+    )
+
+    connection.commit()
+    connection.close()
+
+    result = store.verify_chain()
+
+    assert result["valid"] is False
+
+    assert result["failed_sequence"] == 1
+
+    assert result["reason"] == "event_hash_mismatch"
+
+
+def test_tampered_hmac_is_detected(
+    tmp_path,
+) -> None:
+
+    store, db_path = create_store(tmp_path)
+
+    event = create_event(
+        VerifKVEventType.KV_POLICY_APPLIED,
+        "request-001",
+    )
+
+    store.append(event)
+
+    connection = sqlite3.connect(db_path)
+
+    connection.execute(
+        """
+        UPDATE verifkv_events
+        SET hmac_tag = ?
+        WHERE event_id = ?
+        """,
+        (
+            "1" * 64,
+            str(event.event_id),
+        ),
+    )
+
+    connection.commit()
+    connection.close()
+
+    result = store.verify_chain()
+
+    assert result["valid"] is False
+
+    assert result["failed_sequence"] == 1
+
+    assert result["reason"] == "hmac_mismatch"
+
+
+def test_broken_chain_link_is_detected(
+    tmp_path,
+) -> None:
+
+    store, db_path = create_store(tmp_path)
+
+    first_event = create_event(
+        VerifKVEventType.AUTHZ_DECISION,
+        "request-001",
+    )
+
+    second_event = create_event(
+        VerifKVEventType.ROUTE_ASSIGNED,
+        "request-002",
+    )
+
+    store.append(first_event)
+
+    store.append(second_event)
+
+    connection = sqlite3.connect(db_path)
+
+    connection.execute(
+        """
+        UPDATE verifkv_events
+        SET previous_hash = ?
+        WHERE event_id = ?
+        """,
+        (
+            "BROKEN-PREVIOUS-HASH",
+            str(second_event.event_id),
+        ),
+    )
+
+    connection.commit()
+    connection.close()
+
+    result = store.verify_chain()
+
+    assert result["valid"] is False
+
+    assert result["failed_sequence"] == 2
+
+    assert result["reason"] == "chain_link_mismatch"
+
+
+def test_valid_chain_remains_valid_after_reopening_store(
+    tmp_path,
+) -> None:
+
+    db_path = tmp_path / "verifkv.db"
+
+    first_store = VerifKVStore(
         db_path=str(db_path),
-        hmac_secret="secret",
+        hmac_secret="test-secret",
     )
 
-    writer2 = VerifKVWriter(
-        store2,
-        reconcile_interval_seconds=60.0,
-    )
-
-    service2 = VerifKVService(
-        store=store2,
-        writer=writer2,
-    )
-
-    await service2.start()
-
-    try:
-        db = service2.store._db
-        assert db is not None
-
-        cursor = await db.execute(
-            """
-            SELECT verifkv_seq
-            FROM authz_outbox
-            WHERE outbox_seq = ?
-            """,
-            (outbox_seq,),
+    first_store.append(
+        create_event(
+            VerifKVEventType.AUTHZ_DECISION,
+            "request-001",
         )
+    )
 
-        row = await cursor.fetchone()
+    first_store.append(
+        create_event(
+            VerifKVEventType.ROUTE_ASSIGNED,
+            "request-001",
+        )
+    )
 
-        assert row is not None
-        assert row["verifkv_seq"] is not None
+    first_result = first_store.verify_chain()
 
-        valid, message = await service2.verify()
+    assert first_result["valid"] is True
 
-        assert valid is True
-        assert message == "VerifKV chain is valid"
+    # Simulate restarting the VerifKV service.
+    second_store = VerifKVStore(
+        db_path=str(db_path),
+        hmac_secret="test-secret",
+    )
 
-    finally:
-        await service2.close()
+    second_result = second_store.verify_chain()
+
+    assert second_result["valid"] is True
+
+    assert second_result["verified_events"] == 2

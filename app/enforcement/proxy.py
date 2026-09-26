@@ -4,8 +4,15 @@ import logging
 from typing import Any
 
 import httpx
+from pydantic import SecretStr
 
-from app.enforcement.authorization import VerifKVEventSink
+from app.enforcement.authorization import (
+    VerifKVEventSink,
+)
+from app.enforcement.cache_policy import (
+    build_cache_policy,
+    build_vllm_cache_payload,
+)
 from app.models.verifkv import (
     VerifKVEvent,
     VerifKVEventType,
@@ -20,11 +27,17 @@ class EnforcementProxy:
     pre-pinned inference backends.
 
     Responsibilities:
-        1. Receive an approved routing decision.
-        2. Build the final backend request.
-        3. Inject control-plane cache policy.
-        4. Forward to the selected backend.
-        5. Emit provenance asynchronously.
+
+        1. Receive an already-authorized route.
+        2. Build the authoritative KV-cache policy.
+        3. Remove client-controlled cache policy fields.
+        4. Inject the control-plane cache_salt.
+        5. Forward the request to the selected backend.
+        6. Emit asynchronous provenance events.
+
+    GPU placement is NOT performed here.
+    The backend endpoint is already associated with a
+    pre-pinned serving instance.
     """
 
     def __init__(
@@ -42,12 +55,23 @@ class EnforcementProxy:
         backend_id: str,
         backend_endpoint: str,
         tenant_id: str,
+        tenant_kv_isolation: bool,
+        tenant_cache_salt: SecretStr | None,
         request_id: str,
         request_payload: dict[str, Any],
         decision_id: str,
         policy_version: str,
-        cache_payload: dict[str, Any],
     ) -> httpx.Response:
+        """
+        Forward an authorized request to the selected backend.
+
+        tenant_kv_isolation and tenant_cache_salt must come from
+        the authoritative tenant registry, never from the client.
+        """
+
+        # -----------------------------------------------------
+        # 1. Record successful authorization asynchronously
+        # -----------------------------------------------------
 
         self.verifkv_sink.emit_nowait(
             VerifKVEvent(
@@ -64,6 +88,10 @@ class EnforcementProxy:
             )
         )
 
+        # -----------------------------------------------------
+        # 2. Record route assignment asynchronously
+        # -----------------------------------------------------
+
         self.verifkv_sink.emit_nowait(
             VerifKVEvent(
                 event_type=(VerifKVEventType.ROUTE_ASSIGNED),
@@ -77,26 +105,70 @@ class EnforcementProxy:
             )
         )
 
+        # -----------------------------------------------------
+        # 3. Build authoritative cache policy
+        # -----------------------------------------------------
+
+        cache_policy = build_cache_policy(
+            tenant_id=tenant_id,
+            kv_isolation=tenant_kv_isolation,
+            cache_salt=tenant_cache_salt,
+        )
+
+        cache_payload = build_vllm_cache_payload(cache_policy)
+
+        # -----------------------------------------------------
+        # 4. Copy client payload
+        # -----------------------------------------------------
+
         payload = dict(request_payload)
 
-        # Client-controlled cache_salt must never override
-        # the control-plane policy.
-        payload.pop("cache_salt", None)
+        # -----------------------------------------------------
+        # 5. Remove client-controlled security fields
+        # -----------------------------------------------------
 
-        # The control plane injects the approved cache policy.
+        payload.pop(
+            "cache_salt",
+            None,
+        )
+
+        payload.pop(
+            "tenant_id",
+            None,
+        )
+
+        payload.pop(
+            "request_id",
+            None,
+        )
+
+        # -----------------------------------------------------
+        # 6. Inject authoritative cache policy
+        # -----------------------------------------------------
+
         payload.update(cache_payload)
 
-        # Internal control-plane correlation fields must not
-        # be forwarded to the model server as user fields.
-        payload.pop("tenant_id", None)
-        payload.pop("request_id", None)
+        logger.debug(
+            "Prepared backend request " "tenant=%s backend=%s " "cache_isolation=%s",
+            tenant_id,
+            backend_id,
+            cache_policy.isolation_enabled,
+        )
+
+        # -----------------------------------------------------
+        # 7. Forward to the pre-pinned backend
+        # -----------------------------------------------------
 
         try:
 
             response = await self.http_client.post(
-                f"{backend_endpoint.rstrip('/')}/v1/chat/completions",
+                (f"{backend_endpoint.rstrip('/')}" "/v1/chat/completions"),
                 json=payload,
             )
+
+            # -------------------------------------------------
+            # 8. Record upstream failures asynchronously
+            # -------------------------------------------------
 
             if response.is_error:
 
