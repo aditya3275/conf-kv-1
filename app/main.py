@@ -3,12 +3,12 @@ from __future__ import annotations
 import logging
 import time
 from contextlib import asynccontextmanager
-from uuid import uuid4
+from datetime import datetime, timezone
+from uuid import UUID, uuid4
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import Response
-from pydantic import BaseModel
 
 from app.common.logging import configure_logging
 from app.common.request_context import (
@@ -21,7 +21,7 @@ from app.config.settings import settings
 from app.enforcement.cache_policy import build_cache_policy
 from app.enforcement.proxy import EnforcementProxy
 from app.enforcement.router import EnforcementRouter, RoutingError
-from app.gateway.auth import AuthenticationError, make_authenticator
+from app.gateway.auth import make_authenticator
 from app.models.inference import ClientInferenceRequest
 from app.models.opa import OPARequest
 from app.opa.client import (
@@ -32,8 +32,13 @@ from app.opa.client import (
 from app.registry.backend_registry import BackendRegistry
 from app.registry.health_monitor import BackendHealthMonitor
 from app.registry.tenant_registry import TenantRegistry
-from app.scheduler.scheduler import NoBackendAvailableError, SecurityAwareScheduler
+from app.scheduler.scheduler import (
+    NoBackendAvailableError,
+    SecurityAwareScheduler,
+)
 from app.verifkv.client import VerifKVEventClient
+from app.verifkv.store import VerifKVStore
+from app.verifkv.writer import VerifKVWriter
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +118,7 @@ async def lifespan(app: FastAPI):
     """
 
     tenant_registry = TenantRegistry(settings.tenant_db_path)
+
     backend_registry = BackendRegistry(settings.control_plane_db_path)
 
     opa_client = OPAClient(
@@ -120,15 +126,41 @@ async def lifespan(app: FastAPI):
         timeout_seconds=settings.opa_timeout_seconds,
     )
 
+    # ------------------------------------------------------------------
+    # VerifKV asynchronous event client
+    # ------------------------------------------------------------------
+
     verifkv_client = VerifKVEventClient(
         base_url=settings.verifkv_url,
     )
+
+    # ------------------------------------------------------------------
+    # VerifKV durable authorization outbox + ordered writer
+    # ------------------------------------------------------------------
+
+    verifkv_store = VerifKVStore(
+        db_path=settings.verifkv_db_path,
+        hmac_secret=settings.verifkv_hmac_secret.get_secret_value(),
+    )
+
+    verifkv_writer = VerifKVWriter(
+        store=verifkv_store,
+        reconcile_interval_seconds=(settings.verifkv_reconcile_interval_seconds),
+    )
+
+    # ------------------------------------------------------------------
+    # Backend health monitoring
+    # ------------------------------------------------------------------
 
     health_monitor = BackendHealthMonitor(
         registry=backend_registry,
         interval_seconds=settings.health_cache_ttl_seconds,
         timeout_seconds=settings.health_check_timeout_seconds,
     )
+
+    # ------------------------------------------------------------------
+    # Upstream HTTP client
+    # ------------------------------------------------------------------
 
     upstream_client = httpx.AsyncClient(
         timeout=httpx.Timeout(settings.upstream_timeout_seconds),
@@ -149,6 +181,7 @@ async def lifespan(app: FastAPI):
 
         await tenant_registry.initialize()
         await backend_registry.initialize()
+        await verifkv_store.initialize()
 
         # --------------------------------------------------------------
         # External clients / workers
@@ -156,6 +189,7 @@ async def lifespan(app: FastAPI):
 
         await opa_client.start()
         await verifkv_client.start()
+        await verifkv_writer.start()
 
         # --------------------------------------------------------------
         # Backend health monitoring
@@ -198,7 +232,11 @@ async def lifespan(app: FastAPI):
         app.state.tenant_registry = tenant_registry
         app.state.backend_registry = backend_registry
         app.state.opa_client = opa_client
+
         app.state.verifkv_client = verifkv_client
+        app.state.verifkv_store = verifkv_store
+        app.state.verifkv_writer = verifkv_writer
+
         app.state.health_monitor = health_monitor
         app.state.upstream_client = upstream_client
         app.state.scheduler = scheduler
@@ -213,12 +251,32 @@ async def lifespan(app: FastAPI):
     finally:
         logger.info("Shutting down ConfidentialKV-Scheduler control plane")
 
+        # --------------------------------------------------------------
+        # Stop background workers before closing their storage
+        # --------------------------------------------------------------
+
         await health_monitor.stop()
+
         await verifkv_client.stop()
+
+        await verifkv_writer.stop()
+
+        await verifkv_store.close()
+
+        # --------------------------------------------------------------
+        # Close external clients
+        # --------------------------------------------------------------
+
         await opa_client.close()
+
         await upstream_client.aclose()
 
+        # --------------------------------------------------------------
+        # Close durable registries
+        # --------------------------------------------------------------
+
         await tenant_registry.close()
+
         await backend_registry.close()
 
         logger.info("Control plane shutdown complete")
@@ -245,7 +303,9 @@ async def request_id_middleware(
 
     try:
         response = await call_next(request)
+
         response.headers["X-Request-ID"] = request_id
+
         return response
 
     finally:
@@ -314,16 +374,25 @@ async def chat_completions(
           -> trusted tenant metadata
           -> scheduler recommendation
           -> OPA authorization
+          -> durable authorization outbox
           -> enforcement route
           -> enforcement proxy
           -> serving backend
     """
 
     metrics_registry: Metrics = request.app.state.metrics
+
     scheduler: SecurityAwareScheduler = request.app.state.scheduler
+
     backend_registry: BackendRegistry = request.app.state.backend_registry
+
     opa_client: OPAClient = request.app.state.opa_client
+
     enforcement_proxy: EnforcementProxy = request.app.state.enforcement_proxy
+
+    verifkv_store: VerifKVStore = request.app.state.verifkv_store
+
+    verifkv_writer: VerifKVWriter = request.app.state.verifkv_writer
 
     metrics_registry.request_count += 1
 
@@ -358,9 +427,7 @@ async def chat_completions(
     finally:
         scheduler_elapsed = (time.perf_counter() - scheduler_start) * 1000.0
 
-        metrics_registry.observe_scheduler(
-            scheduler_elapsed,
-        )
+        metrics_registry.observe_scheduler(scheduler_elapsed)
 
     logger.info(
         "Scheduler recommendation tenant=%s backend=%s zone=%s",
@@ -373,9 +440,7 @@ async def chat_completions(
     # 2. Resolve backend from in-memory registry
     # ==============================================================
 
-    backend = backend_registry.get_backend(
-        recommendation.backend_id,
-    )
+    backend = backend_registry.get_backend(recommendation.backend_id)
 
     if backend is None:
         metrics_registry.request_error_count += 1
@@ -394,54 +459,95 @@ async def chat_completions(
         )
 
     # ==============================================================
-    # 3. Construct OPA request
+    # 3. Construct canonical OPA request
     #
-    # request_id is deliberately not included in the OPA contract.
+    # Current OPA contract requires:
+    #
+    # input:
+    #   tenant:
+    #       id
+    #       security_level
+    #       allowed_zones
+    #       active
+    #       quota_remaining
+    #       kv_isolation_required
+    #
+    #   recommendation:
+    #       backend_id
+    #       zone
+    #
+    #   resource:
+    #       backend_id
+    #       configured_status
+    #       health_status
+    #       capacity_available
+    #
+    # request_id is deliberately NOT part of the OPA policy input.
     # ==============================================================
 
-    tenant_data = {
-        "id": tenant.tenant_id,
-        "active": tenant.active,
-        "quota_remaining": tenant.quota_remaining,
-    }
-
-    # Current project code historically used `tier`, while the
-    # scheduling layer now exposes security-level semantics.
-    # Prefer the field expected by the actual OPA contract.
-    opa_tenant_fields = getattr(
-        OPARequest.model_fields["input"].annotation,
-        "model_fields",
-        None,
+    security_level = getattr(
+        tenant.security_level,
+        "value",
+        str(tenant.security_level),
     )
 
-    # The robust path is model validation below; the tenant object
-    # itself remains authoritative.
-    if hasattr(tenant, "tier"):
-        tenant_data["tier"] = tenant.tier
+    allowed_zones = [
+        getattr(
+            zone,
+            "value",
+            str(zone),
+        )
+        for zone in tenant.allowed_zones
+    ]
 
-    if hasattr(tenant, "security_level"):
-        tenant_data["security_level"] = tenant.security_level
+    configured_status = getattr(
+        backend.configured_status,
+        "value",
+        str(backend.configured_status),
+    )
+
+    health_status = getattr(
+        backend.health_status,
+        "value",
+        str(backend.health_status),
+    )
 
     opa_payload = {
         "input": {
-            "tenant": tenant_data,
+            "tenant": {
+                "id": tenant.tenant_id,
+                "security_level": security_level,
+                "allowed_zones": allowed_zones,
+                "active": tenant.active,
+                "quota_remaining": tenant.quota_remaining,
+                "kv_isolation_required": (tenant.kv_isolation_required),
+            },
             "recommendation": {
                 "backend_id": recommendation.backend_id,
-                "zone": recommendation.zone,
+                "zone": getattr(
+                    recommendation.zone,
+                    "value",
+                    str(recommendation.zone),
+                ),
+            },
+            "resource": {
+                "backend_id": backend.backend_id,
+                "configured_status": configured_status,
+                "health_status": health_status,
+                "capacity_available": (backend.capacity_available),
             },
         }
     }
 
     try:
-        opa_request = OPARequest.model_validate(
-            opa_payload,
-        )
+        opa_request = OPARequest.model_validate(opa_payload)
 
     except Exception as exc:
         logger.exception(
-            "Failed to build OPA request tenant=%s request_id=%s",
+            "Failed to build OPA request " "tenant=%s request_id=%s payload=%s",
             tenant.tenant_id,
             request_id,
+            opa_payload,
         )
 
         metrics_registry.request_error_count += 1
@@ -451,6 +557,13 @@ async def chat_completions(
             detail="Invalid internal OPA request contract",
         ) from exc
 
+    logger.debug(
+        "OPA request constructed successfully " "tenant=%s backend=%s request_id=%s",
+        tenant.tenant_id,
+        backend.backend_id,
+        request_id,
+    )
+
     # ==============================================================
     # 4. OPA authorization
     # ==============================================================
@@ -458,9 +571,7 @@ async def chat_completions(
     opa_start = time.perf_counter()
 
     try:
-        opa_response = await opa_client.evaluate(
-            opa_request,
-        )
+        opa_response = await opa_client.evaluate(opa_request)
 
     except OPAUnavailableError as exc:
         metrics_registry.request_error_count += 1
@@ -481,9 +592,7 @@ async def chat_completions(
     finally:
         opa_elapsed = (time.perf_counter() - opa_start) * 1000.0
 
-        metrics_registry.observe_opa(
-            opa_elapsed,
-        )
+        metrics_registry.observe_opa(opa_elapsed)
 
     # ==============================================================
     # 5. OPA DENY = request stops here
@@ -507,13 +616,53 @@ async def chat_completions(
     metrics_registry.policy_allow_count += 1
 
     # ==============================================================
-    # 6. Build authoritative cache policy
+    # 6. Durable authorization outbox
+    #
+    # The authorization decision MUST be durably committed before
+    # forwarding the request to the inference backend.
     # ==============================================================
 
     try:
-        cache_policy = build_cache_policy(
-            tenant,
+        outbox_seq = await verifkv_store.append_authorization_outbox(
+            request_id=UUID(request_id),
+            tenant_id=tenant.tenant_id,
+            decision=opa_response.result.allow,
+            backend_id=recommendation.backend_id,
+            zone=backend.zone,
+            decision_id=opa_response.result.decision_id,
+            policy_version=opa_response.result.policy_version,
+            timestamp=datetime.now(timezone.utc),
+            payload={
+                "reason": opa_response.result.reason,
+                "scheduler_reason": recommendation.reason,
+            },
         )
+
+    except Exception as exc:
+        metrics_registry.request_error_count += 1
+
+        logger.exception(
+            "Failed to durably persist authorization decision "
+            "tenant=%s request_id=%s",
+            tenant.tenant_id,
+            request_id,
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail="Authorization audit persistence failed",
+        ) from exc
+
+    # The durable SQLite outbox is the source of truth.
+    # Queue notification is intentionally non-blocking.
+    verifkv_writer.notify(outbox_seq)
+
+    # ==============================================================
+    # 7. Build authoritative cache policy
+    # ==============================================================
+
+    try:
+        cache_policy = build_cache_policy(tenant)
 
     except ValueError as exc:
         metrics_registry.request_error_count += 1
@@ -524,7 +673,7 @@ async def chat_completions(
         ) from exc
 
     # ==============================================================
-    # 7. Build approved route
+    # 8. Build approved route
     # ==============================================================
 
     routing_start = time.perf_counter()
@@ -548,29 +697,26 @@ async def chat_completions(
     finally:
         routing_elapsed = (time.perf_counter() - routing_start) * 1000.0
 
-        metrics_registry.observe_routing(
-            routing_elapsed,
-        )
+        metrics_registry.observe_routing(routing_elapsed)
 
     # ==============================================================
-    # 8. Enforcement proxy
+    # 9. Enforcement proxy
     #
-    # Client payload -> proxy strips client-controlled security fields
-    # -> proxy injects authoritative cache policy
-    # -> backend request
+    # Client payload
+    #     -> proxy removes client-controlled security fields
+    #     -> proxy injects authoritative cache policy
+    #     -> backend request
     # ==============================================================
 
-    backend_payload = payload.model_dump(
-        mode="json",
-    )
+    backend_payload = payload.model_dump(mode="json")
 
     try:
         upstream_response = await enforcement_proxy.forward(
             backend_id=approved_route.backend_id,
             backend_endpoint=str(approved_route.endpoint),
             tenant_id=tenant.tenant_id,
-            tenant_kv_isolation=approved_route.cache_policy.isolation_enabled,
-            tenant_cache_salt=approved_route.cache_policy.cache_salt,
+            tenant_kv_isolation=(approved_route.cache_policy.isolation_enabled),
+            tenant_cache_salt=(approved_route.cache_policy.cache_salt),
             request_id=request_id,
             request_payload=backend_payload,
             decision_id=approved_route.decision_id,
@@ -582,7 +728,7 @@ async def chat_completions(
         metrics_registry.request_error_count += 1
 
         logger.exception(
-            "Backend forwarding failed tenant=%s backend=%s",
+            "Backend forwarding failed " "tenant=%s backend=%s",
             tenant.tenant_id,
             approved_route.backend_id,
         )
@@ -597,7 +743,7 @@ async def chat_completions(
         metrics_registry.request_error_count += 1
 
         logger.exception(
-            "Unexpected enforcement failure tenant=%s backend=%s",
+            "Unexpected enforcement failure " "tenant=%s backend=%s",
             tenant.tenant_id,
             approved_route.backend_id,
         )
@@ -608,7 +754,7 @@ async def chat_completions(
         ) from exc
 
     # ==============================================================
-    # 9. Return backend response
+    # 10. Return backend response
     # ==============================================================
 
     content_type = upstream_response.headers.get(

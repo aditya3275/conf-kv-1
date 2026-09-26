@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import logging
-import secrets
 from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID, uuid4
@@ -11,7 +12,10 @@ import aiosqlite
 
 from app.models.enums import Zone
 from app.models.outbox import OutboxRecord
-from app.models.verifkv import GENESIS_HASH
+from app.models.verifkv import (
+    GENESIS_HASH,
+    VerifKVEventType,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -49,47 +53,55 @@ WHERE verifkv_seq IS NULL;
 
 
 CREATE TABLE IF NOT EXISTS verifkv_events (
-    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    sequence_number INTEGER PRIMARY KEY AUTOINCREMENT,
 
     event_id TEXT NOT NULL UNIQUE,
 
     event_type TEXT NOT NULL,
 
-    tenant_id TEXT NULL,
+    source TEXT NOT NULL,
 
-    request_id TEXT NULL,
+    tenant_id TEXT,
 
-    payload TEXT NOT NULL,
+    request_id TEXT,
 
-    timestamp TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
 
-    prev_hash TEXT NOT NULL,
+    event_timestamp TEXT NOT NULL,
+
+    previous_hash TEXT NOT NULL,
 
     event_hash TEXT NOT NULL,
 
-    hmac_tag TEXT NOT NULL
+    hmac_tag TEXT NOT NULL,
+
+    stored_at TEXT NOT NULL
 );
 """
 
 
 class VerifKVStore:
     """
-    SQLite persistence layer for the durable authorization outbox
-    and the VerifKV hash chain.
+    SQLite persistence layer for:
 
-    This class owns one dedicated SQLite connection.
+        1. Durable authorization outbox.
+        2. VerifKV tamper-evident hash chain.
 
-    Important:
-        - authorization outbox writes are synchronous/durable
-        - chain folding is performed by the single VerifKV writer
-        - both outbox update and chain insertion happen transactionally
+    The authorization outbox is written synchronously and durably
+    before the request is forwarded to the inference backend.
+
+    A single VerifKVWriter asynchronously folds outbox records into
+    the VerifKV hash chain.
+
+    The outbox update and corresponding VerifKV event insertion happen
+    in one SQLite transaction.
     """
 
     def __init__(
         self,
         db_path: str,
         hmac_secret: str,
-    ):
+    ) -> None:
         self.db_path = db_path
         self.hmac_secret = hmac_secret.encode("utf-8")
 
@@ -122,6 +134,10 @@ class VerifKVStore:
 
         return self._db
 
+    # ------------------------------------------------------------------
+    # Durable authorization outbox
+    # ------------------------------------------------------------------
+
     async def append_authorization_outbox(
         self,
         *,
@@ -141,8 +157,9 @@ class VerifKVStore:
         The transaction MUST complete before the caller forwards
         the request to the LLM serving backend.
 
-        The database generates outbox_seq using AUTOINCREMENT.
+        SQLite generates outbox_seq using AUTOINCREMENT.
         """
+
         db = self._require_db()
 
         authorization_event_id = str(uuid4())
@@ -202,11 +219,12 @@ class VerifKVStore:
         self,
     ) -> list[OutboxRecord]:
         """
-        Returns all authorization records that have not yet
-        been incorporated into VerifKV.
+        Return all authorization records that have not yet been
+        incorporated into VerifKV.
 
-        Ordered by database-generated outbox sequence.
+        Records are returned in durable outbox sequence order.
         """
+
         db = self._require_db()
 
         cursor = await db.execute("""
@@ -236,7 +254,7 @@ class VerifKVStore:
             records.append(
                 OutboxRecord(
                     outbox_seq=row["outbox_seq"],
-                    authorization_event_id=row["authorization_event_id"],
+                    authorization_event_id=(row["authorization_event_id"]),
                     request_id=row["request_id"],
                     tenant_id=row["tenant_id"],
                     decision=bool(row["decision"]),
@@ -252,15 +270,17 @@ class VerifKVStore:
 
         return records
 
-    async def _get_last_hash(
-        self,
-    ) -> str:
+    # ------------------------------------------------------------------
+    # Hash-chain helpers
+    # ------------------------------------------------------------------
+
+    async def _get_last_hash(self) -> str:
         db = self._require_db()
 
         cursor = await db.execute("""
             SELECT event_hash
             FROM verifkv_events
-            ORDER BY seq DESC
+            ORDER BY sequence_number DESC
             LIMIT 1
             """)
 
@@ -276,16 +296,13 @@ class VerifKVStore:
         record: OutboxRecord,
     ) -> int:
         """
-        Converts one durable outbox record into a VerifKV event.
+        Convert one durable authorization outbox record into
+        a VerifKV AUTHZ_DECISION event.
 
-        IMPORTANT:
-            Event insertion and outbox reconciliation are performed
-            in ONE transaction.
-
-        Therefore:
-            either both happen,
-            or neither happens.
+        Event insertion and outbox reconciliation are committed
+        atomically.
         """
+
         db = self._require_db()
 
         if record.outbox_seq is None:
@@ -294,8 +311,10 @@ class VerifKVStore:
         await db.execute("BEGIN IMMEDIATE")
 
         try:
-            # Re-check because another recovery cycle may have already
-            # processed the record.
+            # ----------------------------------------------------------
+            # Re-check the durable record.
+            # ----------------------------------------------------------
+
             cursor = await db.execute(
                 """
                 SELECT
@@ -313,13 +332,26 @@ class VerifKVStore:
 
             if current["verifkv_seq"] is not None:
                 await db.commit()
+
                 return int(current["verifkv_seq"])
 
-            prev_hash = await self._get_last_hash()
+            # ----------------------------------------------------------
+            # Determine previous hash.
+            # ----------------------------------------------------------
+
+            previous_hash = await self._get_last_hash()
 
             event_id = record.authorization_event_id
 
             event_timestamp = record.timestamp.isoformat()
+
+            event_type = VerifKVEventType.AUTHZ_DECISION.value
+
+            source = "control-plane"
+
+            # ----------------------------------------------------------
+            # Build deterministic event payload.
+            # ----------------------------------------------------------
 
             payload = {
                 "decision": record.decision,
@@ -331,26 +363,42 @@ class VerifKVStore:
                 **record.payload,
             }
 
+            # ----------------------------------------------------------
+            # Canonical event representation.
+            #
+            # source participates in the hash because it is part of
+            # the persisted VerifKV event identity.
+            #
+            # stored_at intentionally does NOT participate in hashing;
+            # it is persistence metadata rather than event semantics.
+            # ----------------------------------------------------------
+
             canonical_event = json.dumps(
                 {
                     "event_id": event_id,
-                    "event_type": "authz_decision",
+                    "event_type": event_type,
+                    "source": source,
                     "tenant_id": record.tenant_id,
                     "request_id": record.request_id,
                     "payload": payload,
                     "timestamp": event_timestamp,
-                    "prev_hash": prev_hash,
+                    "prev_hash": previous_hash,
                 },
                 sort_keys=True,
                 separators=(",", ":"),
             )
 
-            import hashlib
-            import hmac
+            # ----------------------------------------------------------
+            # Hash chain.
+            # ----------------------------------------------------------
 
             event_hash = hashlib.sha256(
-                (prev_hash + canonical_event).encode("utf-8")
+                (previous_hash + canonical_event).encode("utf-8")
             ).hexdigest()
+
+            # ----------------------------------------------------------
+            # HMAC integrity tag.
+            # ----------------------------------------------------------
 
             hmac_tag = hmac.new(
                 self.hmac_secret,
@@ -358,24 +406,33 @@ class VerifKVStore:
                 hashlib.sha256,
             ).hexdigest()
 
+            stored_at = datetime.now(timezone.utc).isoformat()
+
+            # ----------------------------------------------------------
+            # Insert immutable VerifKV event.
+            # ----------------------------------------------------------
+
             insert_cursor = await db.execute(
                 """
                 INSERT INTO verifkv_events (
                     event_id,
                     event_type,
+                    source,
                     tenant_id,
                     request_id,
-                    payload,
-                    timestamp,
-                    prev_hash,
+                    payload_json,
+                    event_timestamp,
+                    previous_hash,
                     event_hash,
-                    hmac_tag
+                    hmac_tag,
+                    stored_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     event_id,
-                    "authz_decision",
+                    event_type,
+                    source,
                     record.tenant_id,
                     record.request_id,
                     json.dumps(
@@ -384,16 +441,21 @@ class VerifKVStore:
                         separators=(",", ":"),
                     ),
                     event_timestamp,
-                    prev_hash,
+                    previous_hash,
                     event_hash,
                     hmac_tag,
+                    stored_at,
                 ),
             )
 
-            verifkv_seq = insert_cursor.lastrowid
+            sequence_number = insert_cursor.lastrowid
 
-            if verifkv_seq is None:
+            if sequence_number is None:
                 raise RuntimeError("SQLite did not return VerifKV sequence")
+
+            # ----------------------------------------------------------
+            # Mark the durable outbox record reconciled.
+            # ----------------------------------------------------------
 
             await db.execute(
                 """
@@ -402,75 +464,96 @@ class VerifKVStore:
                 WHERE outbox_seq = ?
                 """,
                 (
-                    int(verifkv_seq),
+                    int(sequence_number),
                     record.outbox_seq,
                 ),
             )
 
+            # ----------------------------------------------------------
+            # Commit both operations atomically.
+            # ----------------------------------------------------------
+
             await db.commit()
 
-            return int(verifkv_seq)
+            return int(sequence_number)
 
         except Exception:
             await db.rollback()
             raise
 
+    # ------------------------------------------------------------------
+    # Chain verification
+    # ------------------------------------------------------------------
+
     async def verify_chain(
         self,
     ) -> tuple[bool, str]:
         """
-        Recomputes the entire VerifKV chain.
+        Recompute and verify the complete VerifKV chain.
 
         Returns:
-            (valid, explanation)
+
+            (True, "VerifKV chain is valid")
+
+        or:
+
+            (False, <explanation>)
         """
+
         db = self._require_db()
 
         cursor = await db.execute("""
             SELECT
-                seq,
+                sequence_number,
                 event_id,
                 event_type,
+                source,
                 tenant_id,
                 request_id,
-                payload,
-                timestamp,
-                prev_hash,
+                payload_json,
+                event_timestamp,
+                previous_hash,
                 event_hash,
                 hmac_tag
             FROM verifkv_events
-            ORDER BY seq ASC
+            ORDER BY sequence_number ASC
             """)
 
         rows = await cursor.fetchall()
 
-        import hashlib
-        import hmac
-
         previous_hash = GENESIS_HASH
 
         for row in rows:
-            payload = json.loads(row["payload"])
+            payload = json.loads(row["payload_json"])
 
             canonical_event = json.dumps(
                 {
                     "event_id": row["event_id"],
                     "event_type": row["event_type"],
+                    "source": row["source"],
                     "tenant_id": row["tenant_id"],
                     "request_id": row["request_id"],
                     "payload": payload,
-                    "timestamp": row["timestamp"],
-                    "prev_hash": row["prev_hash"],
+                    "timestamp": row["event_timestamp"],
+                    "prev_hash": row["previous_hash"],
                 },
                 sort_keys=True,
                 separators=(",", ":"),
             )
 
-            if row["prev_hash"] != previous_hash:
+            # ----------------------------------------------------------
+            # Previous-hash linkage.
+            # ----------------------------------------------------------
+
+            if row["previous_hash"] != previous_hash:
                 return (
                     False,
-                    f"Broken chain at seq={row['seq']}",
+                    ("Broken chain at " f"sequence_number={row['sequence_number']}"),
                 )
+
+            # ----------------------------------------------------------
+            # Event-hash verification.
+            # ----------------------------------------------------------
 
             expected_hash = hashlib.sha256(
                 (previous_hash + canonical_event).encode("utf-8")
@@ -479,8 +562,15 @@ class VerifKVStore:
             if expected_hash != row["event_hash"]:
                 return (
                     False,
-                    f"Event hash mismatch at seq={row['seq']}",
+                    (
+                        "Event hash mismatch at "
+                        f"sequence_number={row['sequence_number']}"
+                    ),
                 )
+
+            # ----------------------------------------------------------
+            # HMAC verification.
+            # ----------------------------------------------------------
 
             expected_hmac = hmac.new(
                 self.hmac_secret,
@@ -494,7 +584,7 @@ class VerifKVStore:
             ):
                 return (
                     False,
-                    f"HMAC mismatch at seq={row['seq']}",
+                    ("HMAC mismatch at " f"sequence_number={row['sequence_number']}"),
                 )
 
             previous_hash = row["event_hash"]

@@ -7,6 +7,9 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field
 
+# Genesis value for the VerifKV tamper-evident hash chain.
+GENESIS_HASH = "0" * 64
+
 
 class VerifKVEventType(str, Enum):
 
