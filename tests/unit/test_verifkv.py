@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+from app.models.verifkv import GENESIS_HASH
 import sqlite3
 
 from app.models.verifkv import (
@@ -151,7 +151,7 @@ def test_stored_event_contains_hash_and_hmac(
     hmac_tag = row[2]
     payload_json = row[3]
 
-    assert previous_hash == "GENESIS"
+    assert previous_hash == GENESIS_HASH
 
     assert len(event_hash) == 64
 

@@ -5,6 +5,7 @@ import hmac
 import json
 import sqlite3
 from datetime import datetime, timezone
+from app.models.verifkv import GENESIS_HASH
 from pathlib import Path
 from threading import Lock
 from typing import Any
@@ -148,7 +149,7 @@ class VerifKVStore:
             """).fetchone()
 
         if row is None:
-            return "GENESIS"
+            return GENESIS_HASH
 
         return str(row["event_hash"])
 
@@ -275,7 +276,7 @@ class VerifKVStore:
                 ORDER BY sequence_number ASC
                 """).fetchall()
 
-        previous_hash = "GENESIS"
+        previous_hash = GENESIS_HASH
 
         verified = 0
 
